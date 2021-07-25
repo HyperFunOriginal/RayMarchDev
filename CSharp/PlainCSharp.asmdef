@@ -1,0 +1,10 @@
+{
+    "name": "PlainCSharp",
+    "references": [
+        "RaymarchRenderer"
+    ],
+    "optionalUnityReferences": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false
+}
