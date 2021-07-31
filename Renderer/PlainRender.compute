@@ -26,7 +26,7 @@ float3 Overbright(float3 col)
     float maxi = max(max(col.x, col.y), col.z);
     if (maxi < 1)
         return col;
-    return lerp(float3(1, 1, 1), col / maxi, 1 / maxi);
+    return lerp(float3(1, 1, 1), col / maxi, 1 / (maxi * maxi));
 }
 
 bool blueshiftEnabled;
@@ -102,6 +102,8 @@ float3 lightDir;
 float2 camAng;
 //float2 skyAng;
 
+float solarLuminosity;
+float exposure;
 float2 dimensions;
 float normalDim;
 float brightness;
@@ -117,7 +119,7 @@ float3 Projection(int2 id)
 
 float4 SkyBox(float3 ray)
 {
-    float sunNess = 0.0074 / max(pow(distance(ray, lightDir) * 1.5, 1.76), 0.0023) - 0.03;
+    float sunNess = 0.0074 / max(pow(distance(ray, lightDir) * 1.5, 1.76), 0.002) * solarLuminosity - 0.03;
     float4 s = float4(1.0, 0.96, 0.94, 1) * max(0, sunNess);
     
     //if (skyAng.x != 0 || skyAng.y != 0)
@@ -128,6 +130,12 @@ float4 SkyBox(float3 ray)
     
     return float4(s.rgb, 1);
 }
+
+float3 hmod(float3 a, float b)
+{
+    return (abs(a) + float3(b * 0.5, b * 0.5, b * 0.5)) % float3(b, b, b) - float3(b * 0.5, b * 0.5, b * 0.5);
+}
+
 [numthreads(32,32,1)]
 void Plain (uint3 id : SV_DispatchThreadID)
 {
@@ -155,7 +163,22 @@ void Plain (uint3 id : SV_DispatchThreadID)
 		while (tD < 30000 && stepSize > 0.001 && !blackhole && !collided)
 		{
             float3 deflection = float3(0, 0, 0);
-			float minDist = 100000;
+            
+            float minDist = 100000;
+            
+            //if (abs(ray - sp[0].pos).y < 2000 && length(ray) < 4000)
+            //{
+            
+            //    minDist = max(length(hmod(ray - sp[0].pos, 400))
+            //- 30.0, 0.5);
+            
+            //    if (minDist < 1)
+            //    {
+            //        collided = true;
+            //        col = float3(1, 0, 1);
+            //    }
+            //}
+            
 			for (uint i = 0; i < number; i++)
 			{
 				Sphere sph = sp[i];
@@ -186,10 +209,10 @@ void Plain (uint3 id : SV_DispatchThreadID)
                         bleushit += objectBlueshift;
                         
                         hitId = i;
-                        col = sph.color * saturate(dot(normalize(delta), lightDir));
+                        col = sph.color * solarLuminosity * saturate(dot(normalize(delta), lightDir));
                         collided = true;
 					}
-				}
+                }
 			}
             minDist = min(minDist, 0.8 / length(deflection));
 			stepSize = minDist;
@@ -303,7 +326,7 @@ void Plain (uint3 id : SV_DispatchThreadID)
                             {
                                 float objectBlueshift = -dot(rayDir, sph.vel);
                                 
-                                reflectionCol = Blueshift(sph.color, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
+                                reflectionCol = Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
                                 reflHit = i;
                                 collided = true;
                             }
@@ -378,7 +401,7 @@ void Plain (uint3 id : SV_DispatchThreadID)
         }
         
     }
-    col = Blueshift(col, bleushit);
+    col = Blueshift(col, bleushit) * exposure;
     Result[id.xy] = float4(Overbright(col), 1);
 }
 float smin(float a, float b, float k)
@@ -431,11 +454,24 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                     
                     if (force < -1)
                     {
-                        col *= 1.0 - transparency;
-                        transparency = 0;
+                        //if (i == 0)
+                        //{
+                        //    ray = delta * sp[1].gravity + sp[1].pos;
+                        //    rayDir = normalize(rayDir - 2 * normalize(delta) * dot(normalize(delta), rayDir));
+                        //}
+                        //else if (i == 1)
+                        //{
+                        //    ray = delta * sp[0].gravity + sp[0].pos;
+                        //    rayDir = normalize(rayDir - 2 * normalize(delta) * dot(normalize(delta), rayDir));
+                        //}
+                        //else
+                        //{
+                            col *= 1.0 - transparency;
+                            transparency = 0;
                         
-                        blackhole = true;
-                        hitId = i;
+                            blackhole = true;
+                            hitId = i;
+                        //}
                     }
                     deflection += normalize(delta) * force;
                 }
@@ -448,12 +484,16 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                     if (dst < 0.003)
                     {
                         hitId = i;
-                        col = lerp(col, Blueshift(sph.color, objectBlueshift) * saturate(dot(normalize(delta), lightDir)), transparency);
+                        col = lerp(col, Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)), transparency);
                         reflTransparency = transparency * transparency;
                         transparency = 0;
                         collided = true;
                     }
-                    
+                    //{
+                    //    float power = 1.0 / (1.0 + dst * 3.0);
+                    //    col += sph.color * stepSize * power;
+                    //    transparency *= 1.0 - power * 0.5;
+                    //}
                     if (dst < (4 + max(sph.atmo.y, -1)) * sph.atmo.x * 2.0)
                     {   
                         float foo = exp(sph.atmo.y);
@@ -539,7 +579,7 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                             if (stepSizeNew <= 0.1)
                                 aCol *= 0.1;
                         }
-                        atmoCol += Blueshift(aCol, objectBlueshift + bleushit) * saturate(pressure * minDist / sph.atmo.x) * transparency;
+                        atmoCol += Blueshift(aCol * solarLuminosity, objectBlueshift + bleushit) * saturate(pressure * minDist / sph.atmo.x) * transparency;
                         transparency *= 1 - saturate(pressure * minDist / sph.atmo.x);
                     }
                 }
@@ -655,7 +695,7 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                             {
                                 float objectBlueshift = -dot(rayDir, sph.vel);
                                 
-                                reflectionCol = Blueshift(sph.color, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
+                                reflectionCol = Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
                                 reflHit = i;
                                 collided = true;
                             }
@@ -730,6 +770,6 @@ void Atmo (uint3 id : SV_DispatchThreadID)
         }
         
     }
-    col = Blueshift(col, bleushit) + atmoCol;
-    Result[id.xy] = float4(Overbright(col), 1);
+    col = Blueshift(col, bleushit) + atmoCol * 1.2;
+    Result[id.xy] = float4(Overbright(col * exposure), 1);
 }

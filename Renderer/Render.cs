@@ -95,6 +95,7 @@ namespace Raymarch
         public float camMovementSpeed;
         internal Vector3 oldCamPos;
         public float FOV;
+        public float exposure;
 
         [Header("Light Data", order = 2)]
         public Vector2 lightDirection;
@@ -102,6 +103,7 @@ namespace Raymarch
         public Texture2D skyBox;
 
         [Header("Settings", order = 4)]
+        public float sunBrightness;
         public bool BlueshiftInvariant;
         public bool shadowsEnabled;
         public bool drawAtmospheres;
@@ -294,7 +296,7 @@ namespace Raymarch
 
             Vector3 lightDir = Math.RotateVector(Vector3.back, lightDirection.x, lightDirection.y);
             Vector3 camDir = Math.RotateVector(Vector3.forward, cameraEulerAngles.x, cameraEulerAngles.y);
-            float skyboxBright = Mathf.Clamp01(1.2f - Vector3.Dot(camDir, lightDir));
+            float skyboxBright = Mathf.Clamp01(1.2f - Vector3.Dot(camDir, lightDir) * sunBrightness);
             Renderer.SetBool("blueshiftEnabled", !BlueshiftInvariant);
             Renderer.SetBool("atmos", drawAtmospheres);
             Renderer.SetFloats("dimensions", screenTex.width * 0.5f, screenTex.height * 0.5f);
@@ -305,6 +307,8 @@ namespace Raymarch
             Renderer.SetFloats("camVel", camVel.x, camVel.y, camVel.z);
             Renderer.SetFloats("lightDir", lightDir.x, lightDir.y, lightDir.z);
             Renderer.SetFloat("normalDim", Mathf.Sqrt(screenTex.width * screenTex.height) * 0.5f / Mathf.Tan(FOV * Mathf.Deg2Rad * 0.5f));
+            Renderer.SetFloat("solarLuminosity", sunBrightness);
+            Renderer.SetFloat("exposure", exposure);
             Renderer.SetFloat("brightness", skyboxBright);
             Renderer.SetBool("shadows", shadowsEnabled);
             Renderer.SetBool("equirect", equirectangularProjection);
