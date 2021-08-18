@@ -25,8 +25,8 @@ public class FPSCounter : MonoBehaviour {
 			yield return new WaitForSecondsRealtime(timestep);
 			fps = frameCount / timestep;
 			frameCount = 0;
-			timestep = 20f / fps;
-			txt.text = "FPS: " + System.Math.Round(fps, 1);
+			timestep = Mathf.Clamp(20f / fps, 0.5f, 1f);
+			txt.text = "FPS: " + Math.Round(fps, 1);
         }
     }
 

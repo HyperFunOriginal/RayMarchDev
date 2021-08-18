@@ -1,19 +1,20 @@
 ﻿// Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel Plain
 #pragma kernel Atmo
+#pragma kernel WriteToScreen
 
 // Create a RenderTexture with enableRandomWrite flag and set it
 // with cs.SetTexture
 struct Sphere
 {
-	float3 pos;
+    float3 pos;
     float radius, gravity;
     float3 color;
     float3 vel;
     float2 atmo;
     float3 atmoCol;
+    float2 ringBounds;
 };
-
 float3 RotateVec(float3 input, float theta, float psi)
 {
     float3 psiChange = float3(input.x, input.y * cos(psi) - input.z * sin(psi), input.y * sin(psi) + input.z * cos(psi));
@@ -21,12 +22,20 @@ float3 RotateVec(float3 input, float theta, float psi)
     return thetaChange;
 }
 
-float3 Overbright(float3 col)
+float3 RotateVec(float3 input, float theta, float psi, float roll)
+{
+    input.xy = float2(cos(roll) * input.x - sin(roll) * input.y, sin(roll) * input.x + cos(roll) * input.y);
+    float3 psiChange = float3(input.x, input.y * cos(psi) - input.z * sin(psi), input.y * sin(psi) + input.z * cos(psi));
+    float3 thetaChange = float3(psiChange.x * cos(theta) + psiChange.z * sin(theta), psiChange.y, psiChange.z * cos(theta) - psiChange.x * sin(theta));
+    return thetaChange;
+}
+
+float4 Overbright(float4 col)
 {
     float maxi = max(max(col.x, col.y), col.z);
     if (maxi < 1)
         return col;
-    return lerp(float3(1, 1, 1), col / maxi, 1 / (maxi * maxi));
+    return lerp(float4(1, 1, 1, 1), col / maxi, 1 / (maxi * maxi));
 }
 
 bool blueshiftEnabled;
@@ -93,9 +102,10 @@ bool equirect;
 
 Texture2D skybox;
 int2 skyboxDimensions;
+int number;
 
 RWStructuredBuffer<Sphere> sp;
-RWTexture2D<float4> Result;
+RWStructuredBuffer<float4> Result;
 
 float3 camVel;
 float3 lightDir;
@@ -106,7 +116,11 @@ float solarLuminosity;
 float exposure;
 float2 dimensions;
 float normalDim;
-float brightness;
+
+int IDToSingle(int2 id)
+{
+    return clamp(id.x, 0, dimensions.x * 2 - 1) + ceil(dimensions.x * 2.0) * clamp(id.y, 0, dimensions.y * 2 - 1);
+}
 
 float3 Projection(int2 id)
 {
@@ -117,248 +131,149 @@ float3 Projection(int2 id)
                     , 1)), camAng.x, camAng.y);
 }
 
+float DistanceToRing(float3 ray, float2 bounds)
+{
+    if (bounds.y <= 0)
+        return 10000000000.0;
+    float3 closestPoint = float3(ray.x, 0, ray.z);
+    closestPoint = normalize(closestPoint) * clamp(length(closestPoint), bounds.x, bounds.y);
+    return length(ray - closestPoint);
+}
+
 float4 SkyBox(float3 ray)
 {
-    float sunNess = 0.0074 / max(pow(distance(ray, lightDir) * 1.5, 1.76), 0.002) * solarLuminosity - 0.03;
+    float sunNess = 0.0074 / max(pow(distance(ray, lightDir) * 1.5, 1.4) - 0.004, 0.0002) * solarLuminosity - 0.03;
     float4 s = float4(1.0, 0.96, 0.94, 1) * max(0, sunNess);
     
     //if (skyAng.x != 0 || skyAng.y != 0)
         //ray = RotateVec(ray, skyAng.x, skyAng.y);
     int lon = (atan2(ray.z, ray.x) / 6.28318530718 + 0.5) * skyboxDimensions.x;
     int lat = (asin(ray.y / length(ray)) / 3.1415926 + 0.5) * skyboxDimensions.y;
-    s += skybox.Load(int3(lon, lat, 0)) * brightness;
+    s += skybox.Load(int3(lon, lat, 0));
     
     return float4(s.rgb, 1);
 }
 
+
+
 float3 hmod(float3 a, float b)
 {
-    return (abs(a) + float3(b * 0.5, b * 0.5, b * 0.5)) % float3(b, b, b) - float3(b * 0.5, b * 0.5, b * 0.5);
+    int3 multiple = round(a / b);
+    multiple.y = saturate(multiple.y);
+    if (multiple.x * multiple.x + multiple.z * multiple.z > 900)
+        multiple.xz /= length(multiple.xz) / 30;
+    if (multiple.x * multiple.x + multiple.z * multiple.z < 400)
+        multiple.xz /= length(multiple.xz) / 20;
+    return a - multiple * b;
 }
 
-[numthreads(32,32,1)]
-void Plain (uint3 id : SV_DispatchThreadID)
+[numthreads(32, 32, 1)]
+void Plain(uint3 id : SV_DispatchThreadID)
 {
+    if (id.x < dimensions.x * 2 && id.y < dimensions.y * 2)
+    {
+    
 	// TODO: insert actual code here!
-	float3 col = float3(0, 0, 0);
-    float3 ray = float3(0, 0, 0);
-    float3 rayDir = Projection(id.xy);
+        float3 col = float3(0, 0, 0);
+        float3 ray = float3(0, 0, 0);
+        float3 rayDir = Projection(id.xy);
     
-    float bleushit = dot(rayDir, camVel);
-    rayDir = normalize(rayDir - camVel * 0.3);
+        float bleushit = dot(rayDir, camVel);
+        rayDir = normalize(rayDir - camVel * 0.3);
     
-	uint number;
-    uint hitId = 4294967295;
-	{
-		uint stride = 0;
-		sp.GetDimensions(number, stride);
-	}
+        uint hitId = 4294967295;
 	
-    bool blackhole = false;
+        bool blackhole = false;
 	//Raymarch
 	{
-        bool collided = false;
-		float tD = 0;
-		float stepSize = 45000;
-		while (tD < 30000 && stepSize > 0.001 && !blackhole && !collided)
-		{
-            float3 deflection = float3(0, 0, 0);
+            bool collided = false;
+            float tD = 0;
+            float stepSize = 45000;
+            while (tD < 30000 && stepSize > 0.001 && !blackhole && !collided)
+            {
+                float3 deflection = float3(0, 0, 0);
             
-            float minDist = 100000;
+                float minDist = 100000;
             
-            //if (abs(ray - sp[0].pos).y < 2000 && length(ray) < 4000)
-            //{
-            
-            //    minDist = max(length(hmod(ray - sp[0].pos, 400))
-            //- 30.0, 0.5);
-            
-            //    if (minDist < 1)
+            //    if (tD < 1000)
             //    {
-            //        collided = true;
-            //        col = float3(1, 0, 1);
+            
+            //        minDist = max(length(hmod(ray - sp[0].pos, 60))
+            //- 10.0, 0.5);
+            
+            //        if (minDist < 1)
+            //        {
+            //            collided = true;
+            //            col = float3(1, 0, 1);
+            //        }
             //    }
-            //}
-            
-			for (uint i = 0; i < number; i++)
-			{
-				Sphere sph = sp[i];
-				float3 delta = ray - sph.pos;
-				float dst = max(length(delta) - sph.radius, 0);
-				
-				if (sph.gravity != 0)
+                
+                for (uint i = 0; i < number; i++)
                 {
-                    minDist = min(minDist, dst);
-                        
-                    float force = -pow(length(delta) / sph.gravity, -3);
-                    
-					if (force < -1)
-                    {
-                        blackhole = true;
-                        hitId = i;
-                    }
-                    deflection += normalize(delta) * force;
-                }
+                    Sphere sph = sp[i];
+                    float3 delta = ray - sph.pos;
+                    float dst = max(length(delta) - sph.radius, 0);
 				
-				if (sph.radius > 0 && !blackhole)
-				{
-                    minDist = min(minDist, dst + 0.003);
-
-					if (dst < 0.003)
-					{
-                        float objectBlueshift = -dot(rayDir, sph.vel);
-                        bleushit += objectBlueshift;
+                    if (sph.gravity != 0)
+                    {
+                        minDist = min(minDist, dst);
                         
-                        hitId = i;
-                        col = sph.color * solarLuminosity * saturate(dot(normalize(delta), lightDir));
-                        collided = true;
-					}
+                        float force = -pow(length(delta) / sph.gravity, -3);
+                    
+                        if (force < -1)
+                        {
+                            blackhole = true;
+                            hitId = i;
+                        }
+                        deflection += normalize(delta) * force;
+                    }
+				
+                    if (sph.radius > 0 && !blackhole)
+                    {
+                        minDist = min(minDist, dst + 0.003);
+
+                        if (dst < 0.003)
+                        {
+                            float objectBlueshift = -dot(rayDir, sph.vel);
+                            bleushit += objectBlueshift;
+                        
+                            hitId = i;
+                            col = sph.color * solarLuminosity * saturate(dot(normalize(delta), lightDir));
+                            collided = true;
+                        }
+                    }
                 }
-			}
-            minDist = min(minDist, 0.8 / length(deflection));
-			stepSize = minDist;
-            rayDir = normalize(rayDir + deflection * stepSize);
+                minDist = min(minDist, 0.8 / length(deflection));
+                stepSize = minDist;
+                rayDir = normalize(rayDir + deflection * stepSize);
             
-            bleushit -= dot(deflection, rayDir) * stepSize * 1.35;
-			tD += stepSize;
-			ray += rayDir * stepSize;
-		}
+                bleushit -= dot(deflection, rayDir) * stepSize * 1.35;
+                tD += stepSize;
+                ray += rayDir * stepSize;
+            }
 		
-        if (!collided && !blackhole)
-            col = SkyBox(rayDir).rgb;
-    }
+            if (!collided && !blackhole)
+                col = SkyBox(rayDir).rgb;
+        }
 	
 	//Shadows
-    if (hitId != 4294967295u && !blackhole && shadows)
-	{
-        float3 reflectionRayDirection = normalize(rayDir - 2 * normalize(ray - sp[hitId].pos) * dot(normalize(ray - sp[hitId].pos), rayDir));
-        float3 reflectionRayOrigin = ray;
-        rayDir = lightDir;
-        
+        if (hitId != 4294967295u && !blackhole && shadows)
         {
-            bool collided = false;
-            float tD = 0;
-            float stepSize = 15000;
-            while (tD < 10000 && stepSize > 0.001 && !collided)
-            {
-                float3 deflection = float3(0, 0, 0);
-                float minDist = 100000;
-                for (uint i = 0; i < number; i++)
-                {
-                    if (i != hitId)
-                    {
-                        Sphere sph = sp[i];
-                        float3 delta = ray - sph.pos;
-                        float dst = max(length(delta) - sph.radius, 0);
-				
-                        if (sph.gravity != 0)
-                        {
-                            minDist = min(minDist, dst);
-                        
-                            float force = -pow(length(delta) / sph.gravity, -3);
-                            if (force < -1)
-                            {
-                                collided = true;
-                                col *= 0.2;
-                                break;
-                            }
-                            deflection += normalize(delta) * force;
-                        }
-				
-                        if (sph.radius > 0 && !collided)
-                        {
-                            minDist = min(minDist, dst + 0.003);
-
-                            if (dst < 0.003)
-                            {
-                                col *= 0.2;
-                                collided = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                minDist = min(minDist, 0.8 / length(deflection));
-                stepSize = minDist;
-                rayDir = normalize(rayDir + deflection * stepSize);
-                tD += stepSize;
-                ray += rayDir * stepSize;
-            }
-        }
-        
-        rayDir = reflectionRayDirection;
-        ray = reflectionRayOrigin;
-        
-        float3 reflectionCol;
-        uint reflHit = 4294967295u;
-        {
-            bool collided = false;
-            float tD = 0;
-            float stepSize = 15000;
-            while (tD < 10000 && stepSize > 0.001 && !collided)
-            {
-                float3 deflection = float3(0, 0, 0);
-                float minDist = 100000;
-                for (uint i = 0; i < number; i++)
-                {
-                    if (i != hitId)
-                    {
-                        Sphere sph = sp[i];
-                        float3 delta = ray - sph.pos;
-                        float dst = max(length(delta) - sph.radius, 0);
-				
-                        if (sph.gravity != 0)
-                        {
-                            minDist = min(minDist, dst);
-                        
-                            float force = -pow(length(delta) / sph.gravity, -3);
-                            if (force < -1)
-                            {
-                                collided = true;
-                            }
-                            deflection += normalize(delta) * force;
-                        }
-				
-                        if (sph.radius > 0 && !collided)
-                        {
-                            minDist = min(minDist, dst + 0.003);
-
-                            if (dst < 0.003)
-                            {
-                                float objectBlueshift = -dot(rayDir, sph.vel);
-                                
-                                reflectionCol = Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
-                                reflHit = i;
-                                collided = true;
-                            }
-                        }
-                    }
-                }
-                minDist = min(minDist, 0.8 / length(deflection));
-                stepSize = minDist;
-                
-                rayDir = normalize(rayDir + deflection * stepSize);
-                tD += stepSize;
-                ray += rayDir * stepSize;
-            }
-            
-            if (!collided)
-                reflectionCol = SkyBox(rayDir).rgb * 0.2;
-            
-            
-            
+            float3 reflectionRayDirection = normalize(rayDir - 2 * normalize(ray - sp[hitId].pos) * dot(normalize(ray - sp[hitId].pos), rayDir));
+            float3 reflectionRayOrigin = ray;
             rayDir = lightDir;
-            if (reflHit != 4294967295u)
-            {
+        
+        {
                 bool collided = false;
                 float tD = 0;
                 float stepSize = 15000;
-                while (tD < 6000 && stepSize > 0.001 && !collided)
+                while (tD < 10000 && stepSize > 0.001 && !collided)
                 {
                     float3 deflection = float3(0, 0, 0);
                     float minDist = 100000;
                     for (uint i = 0; i < number; i++)
                     {
-                        if (i != reflHit)
+                        if (i != hitId)
                         {
                             Sphere sph = sp[i];
                             float3 delta = ray - sph.pos;
@@ -372,7 +287,8 @@ void Plain (uint3 id : SV_DispatchThreadID)
                                 if (force < -1)
                                 {
                                     collided = true;
-                                    reflectionCol *= 0.2;
+                                    col *= 0.2;
+                                    break;
                                 }
                                 deflection += normalize(delta) * force;
                             }
@@ -383,8 +299,9 @@ void Plain (uint3 id : SV_DispatchThreadID)
 
                                 if (dst < 0.003)
                                 {
-                                    reflectionCol *= 0.2;
+                                    col *= 0.2;
                                     collided = true;
+                                    break;
                                 }
                             }
                         }
@@ -396,64 +313,181 @@ void Plain (uint3 id : SV_DispatchThreadID)
                     ray += rayDir * stepSize;
                 }
             }
-            
-            col += reflectionCol * sp[hitId].color;
-        }
         
+            rayDir = reflectionRayDirection;
+            ray = reflectionRayOrigin;
+        
+            float3 reflectionCol;
+            uint reflHit = 4294967295u;
+        {
+                bool collided = false;
+                float tD = 0;
+                float stepSize = 15000;
+                while (tD < 10000 && stepSize > 0.001 && !collided)
+                {
+                    float3 deflection = float3(0, 0, 0);
+                    float minDist = 100000;
+                    for (uint i = 0; i < number; i++)
+                    {
+                        if (i != hitId)
+                        {
+                            Sphere sph = sp[i];
+                            float3 delta = ray - sph.pos;
+                            float dst = max(length(delta) - sph.radius, 0);
+				
+                            if (sph.gravity != 0)
+                            {
+                                minDist = min(minDist, dst);
+                        
+                                float force = -pow(length(delta) / sph.gravity, -3);
+                                if (force < -1)
+                                {
+                                    collided = true;
+                                }
+                                deflection += normalize(delta) * force;
+                            }
+				
+                            if (sph.radius > 0 && !collided)
+                            {
+                                minDist = min(minDist, dst + 0.003);
+
+                                if (dst < 0.003)
+                                {
+                                    float objectBlueshift = -dot(rayDir, sph.vel);
+                                
+                                    reflectionCol = Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
+                                    reflHit = i;
+                                    collided = true;
+                                }
+                            }
+                        }
+                    }
+                    minDist = min(minDist, 0.8 / length(deflection));
+                    stepSize = minDist;
+                
+                    rayDir = normalize(rayDir + deflection * stepSize);
+                    tD += stepSize;
+                    ray += rayDir * stepSize;
+                }
+            
+                if (!collided)
+                    reflectionCol = SkyBox(rayDir).rgb * 0.2;
+            
+            
+            
+                rayDir = lightDir;
+                if (reflHit != 4294967295u)
+                {
+                    bool collided = false;
+                    float tD = 0;
+                    float stepSize = 15000;
+                    while (tD < 6000 && stepSize > 0.001 && !collided)
+                    {
+                        float3 deflection = float3(0, 0, 0);
+                        float minDist = 100000;
+                        for (uint i = 0; i < number; i++)
+                        {
+                            if (i != reflHit)
+                            {
+                                Sphere sph = sp[i];
+                                float3 delta = ray - sph.pos;
+                                float dst = max(length(delta) - sph.radius, 0);
+				
+                                if (sph.gravity != 0)
+                                {
+                                    minDist = min(minDist, dst);
+                        
+                                    float force = -pow(length(delta) / sph.gravity, -3);
+                                    if (force < -1)
+                                    {
+                                        collided = true;
+                                        reflectionCol *= 0.2;
+                                    }
+                                    deflection += normalize(delta) * force;
+                                }
+				
+                                if (sph.radius > 0 && !collided)
+                                {
+                                    minDist = min(minDist, dst + 0.003);
+
+                                    if (dst < 0.003)
+                                    {
+                                        reflectionCol *= 0.2;
+                                        collided = true;
+                                    }
+                                }
+                            }
+                        }
+                        minDist = min(minDist, 0.8 / length(deflection));
+                        stepSize = minDist;
+                        rayDir = normalize(rayDir + deflection * stepSize);
+                        tD += stepSize;
+                        ray += rayDir * stepSize;
+                    }
+                }
+            
+                col += reflectionCol * sp[hitId].color;
+            }
+        
+        }
+        col = Blueshift(col, bleushit) * exposure;
+        Result[IDToSingle(id.xy)] = float4(col, 1);
     }
-    col = Blueshift(col, bleushit) * exposure;
-    Result[id.xy] = float4(Overbright(col), 1);
 }
 float smin(float a, float b, float k)
 {
     float h = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
     return lerp(a, b, h) - k * h * (1.0 - h);
 }
-[numthreads(32,32,1)]
-void Atmo (uint3 id : SV_DispatchThreadID)
+
+[numthreads(32, 32, 1)]
+void Atmo(uint3 id : SV_DispatchThreadID)
 {
-	// TODO: insert actual code here!
-	float3 col = float3(0, 0, 0);
-    float3 ray = float3(0, 0, 0);
-    float3 rayDir = Projection(id.xy);
     
-    float bleushit = dot(rayDir, camVel);
-    rayDir = normalize(rayDir - camVel * 0.3);
-    
-	uint number;
-    uint hitId = 4294967295;
-	{
-		uint stride = 0;
-		sp.GetDimensions(number, stride);
-	}
-	
-    bool blackhole = false;
-	//Raymarch
-    float3 atmoCol = float3(0, 0, 0);
-    float transparency = 1;
-    float reflTransparency = 0;
+    if (id.x < dimensions.x * 2 && id.y < dimensions.y * 2)
     {
-        bool collided = false;
-        float tD = 0;
-        float stepSize = 45000;
-        while (tD < 30000 && stepSize > 0.001 && transparency > 0.003)
-        {
-            float3 deflection = float3(0, 0, 0);
-            float minDist = 100000;
-            for (uint i = 0; i < number; i++)
+        float reflTransparency = 1;
+	// TODO: insert actual code here!
+        float3 col = float3(0, 0, 0);
+        float3 ray = float3(0, 0, 0);
+        float3 rayDir = Projection(id.xy);
+    
+        float bleushit = dot(rayDir, camVel);
+        rayDir = normalize(rayDir - camVel * 0.3);
+    
+        uint hitId = 4294967295;
+	
+        bool blackhole = false;
+	//Raymarch
+        float3 atmoCol = float3(0, 0, 0);
+        float3 ringCol = float3(0, 0, 0);
+        float transparency = 1;
+    {
+            bool collided = false;
+            float tD = 0;
+            float stepSize = 45000;
+            while (tD < 30000 && stepSize > 0.001 && transparency > 0.001)
             {
-                Sphere sph = sp[i];
-                float3 delta = ray - sph.pos;
-                float dst = max(length(delta) - sph.radius, 0);
-				
-                if (sph.gravity != 0)
+                reflTransparency = transparency;
+                
+                float3 deflection = float3(0, 0, 0);
+                float minDist = 100000;
+                
+                
+                for (uint i = 0; i < number; i++)
                 {
-                    minDist = min(minDist, dst);
-                        
-                    float force = -pow(length(delta) / sph.gravity, -3);
-                    
-                    if (force < -1)
+                    Sphere sph = sp[i];
+                    float3 delta = ray - sph.pos;
+                    float dst = max(length(delta) - sph.radius, 0);
+				
+                    if (sph.gravity != 0)
                     {
+                        minDist = min(minDist, dst);
+                        
+                        float force = -pow(length(delta) / sph.gravity, -3);
+                    
+                        if (force < -1)
+                        {
                         //if (i == 0)
                         //{
                         //    ray = delta * sp[1].gravity + sp[1].pos;
@@ -472,262 +506,201 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                             blackhole = true;
                             hitId = i;
                         //}
+                        }
+                        deflection += normalize(delta) * force;
                     }
-                    deflection += normalize(delta) * force;
-                }
 				
-                if (sph.radius > 0 && !blackhole)
-                {
-                    minDist = min(minDist, dst + 0.003);
-                    
-                    float objectBlueshift = -dot(rayDir, sph.vel);
-                    if (dst < 0.003)
+                    if (sph.radius > 0 && !blackhole)
                     {
-                        hitId = i;
-                        col = lerp(col, Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)), transparency);
-                        reflTransparency = transparency * transparency;
-                        transparency = 0;
-                        collided = true;
-                    }
+                        {
+                            float rdst = DistanceToRing(ray - sph.pos, sph.ringBounds); //Ring
+                            if (rdst < 2)
+                            {
+                                float stepSizeNew = 1.01;
+                                if (shadows)
+                                {
+                                    float3 rayN = ray;
+                                    float3 rayDirN = lightDir;
+                                    float TDN = 0;
+                                    int iter = 0;
+                                    while (TDN < 10000 && stepSizeNew > 0.8 && iter < 12)
+                                    {
+                                        float minDistN = 29032;
+                                        iter++;
+                                
+                                        for (uint z = 0; z < number; z++)
+                                        {
+                                            Sphere s = sp[z];
+                                            float dstN = distance(rayN, s.pos);
+                                            rayDirN -= normalize(rayN - s.pos) * pow(dstN / s.gravity, -3);
+                                        
+                                            minDistN = min(minDistN, max(dstN - s.radius, 0));
+                                        }
+                                        rayDirN = normalize(rayDirN);
+                                        stepSizeNew = minDistN + 0.5;
+                                        rayN += rayDirN * stepSizeNew;
+                                        TDN += stepSizeNew;
+                                    }
+                                }
+                                if (stepSizeNew > 1.0)
+                                {
+                                    ringCol += Blueshift(float3(0.4, 0.414, 0.43), bleushit) * saturate(1.0 - dot(rayDir, lightDir)) * solarLuminosity * transparency * 0.03;
+                                }
+                                transparency *= rdst * 0.025 + 0.95;
+                            }
+                            rdst += 0.35 / (abs(rayDir.y) + 0.1);
+                            
+                            minDist = min(rdst, minDist);
+                        }
+                        minDist = min(minDist, dst + 0.003);
+                        float objectBlueshift = -dot(rayDir, sph.vel);
+                        if (dst < 0.003)
+                        {
+                            hitId = i;
+                            col = lerp(col, Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)), transparency);
+                            transparency = 0;
+                            collided = true;
+                        }
                     //{
                     //    float power = 1.0 / (1.0 + dst * 3.0);
                     //    col += sph.color * stepSize * power;
                     //    transparency *= 1.0 - power * 0.5;
                     //}
-                    if (dst < (4 + max(sph.atmo.y, -1)) * sph.atmo.x * 2.0)
-                    {   
-                        float foo = exp(sph.atmo.y);
-                        bool shadowA = false;
-                        float pressure = exp(sph.atmo.y - 1.4 - dst / sph.atmo.x);
-                        float3 aCol = sph.atmoCol;
-                        float3 cCol = (1 - sph.atmoCol);
-                        { //Main Body Shadow Cast
-                            float3 rayN = ray + lightDir * (sph.atmo.x * 0.1 + foo * 0.035 + sph.radius * 0.013);
-                            for (int j = 0; j < 8; j++)
-                            {
-                                float dstN = distance(rayN, sph.pos) - sph.radius;
-                                if (dstN < 0)
-                                {
-                                    shadowA = true;
-                                    j = 9;
-                                }
-                                else
-                                {
-                                    float opticalDensity = exp(sph.atmo.y - 1.65 - dstN / sph.atmo.x);
-                                    aCol *= exp(-0.5 * opticalDensity);
-                                    cCol *= exp(-0.5 * opticalDensity);
-                                }
-                                aCol *= saturate(dstN * 3.0 / sph.atmo.x);
-                                cCol *= saturate(dstN * 3.0 / sph.atmo.x);
-                                rayN += lightDir * (sph.atmo.x * 0.325 + foo * 0.07 + sph.radius * 0.036);
-                            }
-                        }
-                        if (!shadowA) // Scattering & light extinction
+                        if (dst < (4 + max(sph.atmo.y, -1)) * sph.atmo.x * 2.0)
                         {
-                            float rayleighStrength = smin(dot(rayDir, lightDir), 0.025, -0.4);
-                            float3 rayN = ray + lightDir * (sph.atmo.x * 0.1);
-                            for (int j = 0; j < 6; j++)
-                            {
-                                float dstN = distance(rayN, sph.pos) - sph.radius;
-                                if (dstN < 0)
+                            float foo = exp(sph.atmo.y);
+                            bool shadowA = false;
+                            float pressure = exp(sph.atmo.y - 1.4 - dst / sph.atmo.x);
+                            float3 aCol = sph.atmoCol;
+                            float3 cCol = (1 - sph.atmoCol);
+                            { //Main Body Shadow Cast
+                                float3 rayN = ray + lightDir * (sph.atmo.x * 0.1 + foo * 0.035 + sph.radius * 0.013);
+                                for (int j = 0; j < 8; j++)
                                 {
-                                    aCol *= 0;
-                                    shadowA = true;
-                                    j = 7;
-                                }
-                                else
-                                {
-                                    float opticalDensity = exp(sph.atmo.y - 1.65 - dstN / sph.atmo.x);
-                                    
-                                    aCol = lerp(aCol, cCol, opticalDensity * rayleighStrength * 1.8) * exp(-0.5 * opticalDensity);
-                                    cCol *= exp(-0.5 * opticalDensity);
-                                }
-                                rayN += lightDir * (sph.atmo.x * 0.2 + foo * 0.02);
-                            }
-                        }
-                        
-                        if (!shadowA && pressure > 0.0005 && shadows)
-                        {
-                            float3 rayN = ray;
-                            float3 rayDirN = lightDir;
-                            float TDN = 0;
-                            float stepSizeNew = 1;
-                            int iter = 0;
-                            while (TDN < 10000 && stepSizeNew > 0.1 && iter < 8)
-                            {
-                                float minDistN = 29032;
-                                iter++;
-                                
-                                for (uint z = 0; z < number; z++)
-                                {
-                                    if (z != i)
+                                    float dstN = distance(rayN, sph.pos) - sph.radius;
+                                    if (dstN < 0)
                                     {
-                                        Sphere s = sp[z];
-                                        float dstN = distance(rayN, s.pos);
-                                        rayDirN -= normalize(rayN - s.pos) * pow(dstN / s.gravity, -3);
-                                        
-                                        dstN = max(dstN - s.radius, 0);
-                                        aCol *= saturate(1 - exp(s.atmo.y - 1.3 - dstN / s.atmo.x));
-                                        minDistN = min(minDistN, dstN);
+                                        shadowA = true;
+                                        j = 9;
                                     }
+                                    else
+                                    {
+                                        float opticalDensity = exp(sph.atmo.y - 1.65 - dstN / sph.atmo.x);
+                                        aCol *= exp(-0.5 * opticalDensity);
+                                        cCol *= exp(-0.5 * opticalDensity);
+                                    }
+                                    aCol *= saturate(dstN * 3.0 / sph.atmo.x);
+                                    cCol *= saturate(dstN * 3.0 / sph.atmo.x);
+                                    rayN += lightDir * (sph.atmo.x * 0.325 + foo * 0.07 + sph.radius * 0.036);
                                 }
-                                rayDirN = normalize(rayDirN);
-                                stepSizeNew = minDistN;
-                                rayN += rayDirN * stepSizeNew;
-                                TDN += stepSizeNew;
                             }
-                            if (stepSizeNew <= 0.1)
-                                aCol *= 0.1;
-                        }
-                        atmoCol += Blueshift(aCol * solarLuminosity, objectBlueshift + bleushit) * saturate(pressure * minDist / sph.atmo.x) * transparency;
-                        transparency *= 1 - saturate(pressure * minDist / sph.atmo.x);
-                    }
-                }
-            }
-            minDist = min(minDist * 0.8236, 0.8 / length(deflection));
-            stepSize = minDist;
-            rayDir = normalize(rayDir + deflection * stepSize);
-            
-            bleushit -= dot(deflection, rayDir) * stepSize * 1.35;
-            tD += stepSize;
-            ray += rayDir * stepSize;
-        }
-		
-        col = lerp(col, SkyBox(rayDir).rgb, transparency);
-    }
-	//Shadows
-    
-    if (hitId != 4294967295u && !blackhole && shadows)
-    {
-        float3 reflectionRayDirection = normalize(rayDir - 2 * normalize(ray - sp[hitId].pos) * dot(normalize(ray - sp[hitId].pos), rayDir));
-        float3 reflectionRayOrigin = ray;
-        rayDir = lightDir;
-        
-        {
-            bool collided = false;
-            float tD = 0;
-            float stepSize = 15000;
-            while (tD < 10000 && stepSize > 0.001 && !collided)
-            {
-                float3 deflection = float3(0, 0, 0);
-                float minDist = 100000;
-                for (uint i = 0; i < number; i++)
-                {
-                    if (i != hitId)
-                    {
-                        Sphere sph = sp[i];
-                        float3 delta = ray - sph.pos;
-                        float dst = max(length(delta) - sph.radius, 0);
-				
-                        if (sph.gravity != 0)
-                        {
-                            minDist = min(minDist, dst);
+                            if (!shadowA) // Scattering & light extinction
+                            {
+                                float rayleighStrength = smin(dot(rayDir, lightDir) + 0.2, 0.1, -0.4);
+                                float3 rayN = ray + lightDir * (sph.atmo.x * 0.1);
+                                for (int j = 0; j < 6; j++)
+                                {
+                                    float dstN = distance(rayN, sph.pos) - sph.radius;
+                                    if (dstN < 0)
+                                    {
+                                        aCol *= 0;
+                                        shadowA = true;
+                                        j = 7;
+                                    }
+                                    else
+                                    {
+                                        float opticalDensity = exp(sph.atmo.y - 1.65 - dstN / sph.atmo.x);
+                                    
+                                        aCol = lerp(aCol, cCol, opticalDensity * rayleighStrength * 1.8) * exp(-0.5 * opticalDensity);
+                                        cCol *= exp(-0.5 * opticalDensity);
+                                    }
+                                    rayN += lightDir * (sph.atmo.x * 0.2 + foo * 0.02);
+                                }
+                            }
                         
-                            float force = -pow(length(delta) / sph.gravity, -3);
-                            if (force < -1)
+                            if (!shadowA && pressure > 0.0005 && shadows)
                             {
-                                collided = true;
-                                col *= 0.2;
-                                break;
+                                float3 rayN = ray;
+                                float3 rayDirN = lightDir;
+                                float TDN = 0;
+                                float stepSizeNew = 1;
+                                int iter = 0;
+                                while (TDN < 10000 && stepSizeNew > 0.1 && iter < 10)
+                                {
+                                    float minDistN = 29032;
+                                    iter++;
+                                    
+                                    for (uint z = 0; z < number; z++)
+                                    {
+                                        {
+                                        
+                                            float rdst = DistanceToRing(rayN - sp[z].pos, sp[z].ringBounds); // Ring
+                                            aCol *= saturate(rdst * 0.06 + 0.6);
+                                            rdst += 3.3 / (abs(rayDirN.y) + 0.07);
+                                            minDistN = min(minDistN, rdst);
+                                        }
+                                        
+                                        if (z != i)
+                                        {
+                                            Sphere s = sp[z];
+                                            float dstN = distance(rayN, s.pos);
+                                            rayDirN -= normalize(rayN - s.pos) * pow(dstN / s.gravity, -3);
+                                        
+                                            dstN = max(dstN - s.radius, 0);
+                                            aCol *= saturate(1 - exp(s.atmo.y - 1.3 - dstN / s.atmo.x));
+                                            minDistN = min(minDistN, dstN);
+                                        }
+                                    }
+                                    rayDirN = normalize(rayDirN);
+                                    stepSizeNew = minDistN;
+                                    rayN += rayDirN * stepSizeNew;
+                                    TDN += stepSizeNew;
+                                }
+                                if (stepSizeNew <= 0.1)
+                                    aCol *= 0.1;
                             }
-                            deflection += normalize(delta) * force;
-                        }
-				
-                        if (sph.radius > 0 && !collided)
-                        {
-                            minDist = min(minDist, dst + 0.003);
-
-                            if (dst < 0.003)
-                            {
-                                col *= 0.2;
-                                collided = true;
-                                break;
-                            }
+                            atmoCol += Blueshift(aCol * solarLuminosity, objectBlueshift + bleushit) * saturate(pressure * minDist / sph.atmo.x) * transparency;
+                            transparency *= 1 - saturate(pressure * minDist / sph.atmo.x);
                         }
                     }
                 }
-                minDist = min(minDist, 0.8 / length(deflection));
+                minDist = min(minDist * 0.8236, 0.8 / length(deflection));
                 stepSize = minDist;
                 rayDir = normalize(rayDir + deflection * stepSize);
+            
+                bleushit -= dot(deflection, rayDir) * stepSize * 1.35;
                 tD += stepSize;
                 ray += rayDir * stepSize;
             }
+            if (transparency > 0.001)
+                col = lerp(col, SkyBox(rayDir).rgb, transparency);
         }
+	    //Shadows
         
-        rayDir = reflectionRayDirection;
-        ray = reflectionRayOrigin;
-        
-        float3 reflectionCol;
-        uint reflHit = 4294967295u;
+        if (hitId != 4294967295u && !blackhole && shadows)
         {
-            bool collided = false;
-            float tD = 0;
-            float stepSize = 15000;
-            while (tD < 10000 && stepSize > 0.001 && !collided)
-            {
-                float3 deflection = float3(0, 0, 0);
-                float minDist = 100000;
-                for (uint i = 0; i < number; i++)
-                {
-                    if (i != hitId)
-                    {
-                        Sphere sph = sp[i];
-                        float3 delta = ray - sph.pos;
-                        float dst = max(length(delta) - sph.radius, 0);
-				
-                        if (sph.gravity != 0)
-                        {
-                            minDist = min(minDist, dst);
-                        
-                            float force = -pow(length(delta) / sph.gravity, -3);
-                            if (force < -1)
-                            {
-                                collided = true;
-                            }
-                            deflection += normalize(delta) * force;
-                        }
-				
-                        if (sph.radius > 0 && !collided)
-                        {
-                            minDist = min(minDist, dst + 0.003);
-
-                            if (dst < 0.003)
-                            {
-                                float objectBlueshift = -dot(rayDir, sph.vel);
-                                
-                                reflectionCol = Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
-                                reflHit = i;
-                                collided = true;
-                            }
-                        }
-                    }
-                }
-                minDist = min(minDist, 0.8 / length(deflection));
-                stepSize = minDist;
-                
-                rayDir = normalize(rayDir + deflection * stepSize);
-                tD += stepSize;
-                ray += rayDir * stepSize;
-            }
-            
-            if (!collided)
-                reflectionCol = SkyBox(rayDir).rgb * 0.2;
-            
-            reflectionCol *= reflTransparency * sp[hitId].color;
-            
+            float3 reflectionRayDirection = normalize(rayDir - 2 * normalize(ray - sp[hitId].pos) * dot(normalize(ray - sp[hitId].pos), rayDir));
+            float3 reflectionRayOrigin = ray + normalize(ray - sp[hitId].pos) * 0.1;
             rayDir = lightDir;
-            if (reflHit != 4294967295u)
             {
                 bool collided = false;
                 float tD = 0;
                 float stepSize = 15000;
-                while (tD < 6000 && stepSize > 0.001 && !collided)
+                while (tD < 10000 && stepSize > 0.001 && !collided)
                 {
                     float3 deflection = float3(0, 0, 0);
                     float minDist = 100000;
+                    
                     for (uint i = 0; i < number; i++)
                     {
-                        if (i != reflHit)
+                        {
+                            float rdst = DistanceToRing(ray - sp[i].pos, sp[i].ringBounds); //Ring
+                            col *= saturate(rdst * 0.03 + 0.94);
+                            rdst += 0.5;
+                            minDist = min(minDist, rdst);
+                        }
+                    
+                        if (i != hitId)
                         {
                             Sphere sph = sp[i];
                             float3 delta = ray - sph.pos;
@@ -741,7 +714,8 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                                 if (force < -1)
                                 {
                                     collided = true;
-                                    reflectionCol *= 0.2;
+                                    col *= 0.2;
+                                    break;
                                 }
                                 deflection += normalize(delta) * force;
                             }
@@ -752,8 +726,9 @@ void Atmo (uint3 id : SV_DispatchThreadID)
 
                                 if (dst < 0.003)
                                 {
-                                    reflectionCol *= 0.2;
+                                    col *= 0.2;
                                     collided = true;
+                                    break;
                                 }
                             }
                         }
@@ -766,10 +741,288 @@ void Atmo (uint3 id : SV_DispatchThreadID)
                 }
             }
             
-            col += reflectionCol;
+            
+            rayDir = reflectionRayDirection;
+            ray = reflectionRayOrigin;
+        
+            float3 reflectionCol;
+            float3 reflectionRingCol = 0;
+            uint reflHit = 4294967295u;
+            {
+                float3 atmoCol2 = float3(0, 0, 0);
+                bool collided = false;
+                float tD = 0;
+                float stepSize = 15000;
+                while (tD < 10000 && stepSize > 0.01 && !collided)
+                {
+                    float3 deflection = float3(0, 0, 0);
+                    float minDist = 100000;
+
+                    for (uint i = 0; i < number; i++)
+                    {
+                        {
+                            float rdst = DistanceToRing(ray - sp[i].pos, sp[i].ringBounds); //Ring
+                            if (rdst < 2)
+                            {
+                                float stepSizeNew = 1.01;
+                                if (shadows)
+                                {
+                                    float3 rayN = ray;
+                                    float3 rayDirN = lightDir;
+                                    float TDN = 0;
+                                    int iter = 0;
+                                    while (TDN < 10000 && stepSizeNew > 0.8 && iter < 12)
+                                    {
+                                        float minDistN = 29032;
+                                        iter++;
+                                
+                                        for (uint z = 0; z < number; z++)
+                                        {
+                                            Sphere s = sp[z];
+                                            float dstN = distance(rayN, s.pos);
+                                            rayDirN -= normalize(rayN - s.pos) * pow(dstN / s.gravity, -3);
+                                        
+                                            minDistN = min(minDistN, max(dstN - s.radius, 0));
+                                        }
+                                        rayDirN = normalize(rayDirN);
+                                        stepSizeNew = minDistN + 0.5;
+                                        rayN += rayDirN * stepSizeNew;
+                                        TDN += stepSizeNew;
+                                    }
+                                }
+                                if (stepSizeNew > 1.0)
+                                {
+                                    reflectionRingCol += float3(0.4, 0.414, 0.43) * saturate(1.0 - dot(rayDir, lightDir)) * solarLuminosity * reflTransparency * 0.03;
+                                }
+                                reflTransparency *= rdst * 0.025 + 0.95;
+                            }
+                            rdst += 0.35 / (abs(rayDir.y) + 0.1);
+                            
+                            minDist = min(minDist, rdst);
+                        }
+                        
+                        Sphere sph = sp[i];
+                        float3 delta = ray - sph.pos;
+                        float dst = max(length(delta) - sph.radius, 0);
+				
+                        if (sph.gravity != 0)
+                        {
+                            minDist = min(minDist, dst);
+                        
+                            float force = -pow(length(delta) / sph.gravity, -3);
+                            if (force < -1)
+                            {
+                                collided = true;
+                            }
+                            deflection += normalize(delta) * force;
+                        }
+				
+                        if (sph.radius > 0 && !collided)
+                        {
+                            minDist = min(minDist, dst + 0.01);
+                            if (dst < 0.03 && i != hitId)
+                            {
+                                float objectBlueshift = -dot(rayDir, sph.vel);
+                                
+                                reflectionCol = Blueshift(sph.color * solarLuminosity, objectBlueshift) * saturate(dot(normalize(delta), lightDir)) * 0.25;
+                                reflHit = i;
+                                collided = true;
+                            }
+                            if (dst < (4 + max(sph.atmo.y, -1)) * sph.atmo.x * 2.0)
+                            {
+                                float foo = exp(sph.atmo.y);
+                                bool shadowA = false;
+                                float pressure = exp(sph.atmo.y - 1.4 - dst / sph.atmo.x);
+                                float3 aCol = sph.atmoCol;
+                                float3 cCol = (1 - sph.atmoCol);
+                                { //Main Body Shadow Cast
+                                    float3 rayN = ray + lightDir * (sph.atmo.x * 0.1 + foo * 0.035 + sph.radius * 0.013);
+                                    for (int j = 0; j < 8; j++)
+                                    {
+                                        float dstN = distance(rayN, sph.pos) - sph.radius;
+                                        if (dstN < 0)
+                                        {
+                                            shadowA = true;
+                                            j = 9;
+                                        }
+                                        else
+                                        {
+                                            float opticalDensity = exp(sph.atmo.y - 1.65 - dstN / sph.atmo.x);
+                                            aCol *= exp(-0.5 * opticalDensity);
+                                            cCol *= exp(-0.5 * opticalDensity);
+                                        }
+                                        aCol *= saturate(dstN * 3.0 / sph.atmo.x);
+                                        cCol *= saturate(dstN * 3.0 / sph.atmo.x);
+                                        rayN += lightDir * (sph.atmo.x * 0.325 + foo * 0.07 + sph.radius * 0.036);
+                                    }
+                                }
+                                if (!shadowA) // Scattering & light extinction
+                                {
+                                    float rayleighStrength = smin(dot(rayDir, lightDir), 0.025, -0.4);
+                                    float3 rayN = ray + lightDir * (sph.atmo.x * 0.1);
+                                    for (int j = 0; j < 6; j++)
+                                    {
+                                        float dstN = distance(rayN, sph.pos) - sph.radius;
+                                        if (dstN < 0)
+                                        {
+                                            aCol *= 0;
+                                            shadowA = true;
+                                            j = 7;
+                                        }
+                                        else
+                                        {
+                                            float opticalDensity = exp(sph.atmo.y - 1.65 - dstN / sph.atmo.x);
+                                    
+                                            aCol = lerp(aCol, cCol, opticalDensity * rayleighStrength * 1.8) * exp(-0.5 * opticalDensity);
+                                            cCol *= exp(-0.5 * opticalDensity);
+                                        }
+                                        rayN += lightDir * (sph.atmo.x * 0.2 + foo * 0.02);
+                                    }
+                                }
+                        
+                                if (!shadowA && pressure > 0.0005 && shadows)
+                                {
+                                    float3 rayN = ray;
+                                    float3 rayDirN = lightDir;
+                                    float TDN = 0;
+                                    float stepSizeNew = 1;
+                                    int iter = 0;
+                                    while (TDN < 10000 && stepSizeNew > 0.1 && iter < 8)
+                                    {
+                                        float minDistN = 29032;
+                                        iter++;
+                                
+                                        for (uint z = 0; z < number; z++)
+                                        {
+                                            if (z != i)
+                                            {
+                                                Sphere s = sp[z];
+                                                float dstN = distance(rayN, s.pos);
+                                                rayDirN -= normalize(rayN - s.pos) * pow(dstN / s.gravity, -3);
+                                        
+                                                dstN = max(dstN - s.radius, 0);
+                                                aCol *= saturate(1 - exp(s.atmo.y - 1.3 - dstN / s.atmo.x));
+                                                minDistN = min(minDistN, dstN);
+                                            }
+                                        }
+                                        rayDirN = normalize(rayDirN);
+                                        stepSizeNew = minDistN;
+                                        rayN += rayDirN * stepSizeNew;
+                                        TDN += stepSizeNew;
+                                    }
+                                    if (stepSizeNew <= 0.1)
+                                        aCol *= 0.1;
+                                }
+                                atmoCol2 += aCol * solarLuminosity * saturate(pressure * minDist / sph.atmo.x) * reflTransparency;
+                                reflTransparency *= 1 - saturate(pressure * minDist / sph.atmo.x);
+                            }
+                        }
+                    }
+                    minDist = min(minDist * 0.876, 0.8 / length(deflection));
+                    stepSize = minDist;
+                
+                    rayDir = normalize(rayDir + deflection * stepSize);
+                    tD += stepSize;
+                    ray += rayDir * stepSize;
+                }
+            
+                if (!collided)
+                    reflectionCol = SkyBox(rayDir).rgb * 0.2;
+            
+                reflectionCol *= reflTransparency * sp[hitId].color;
+                reflectionCol += atmoCol2 * 0.25 + reflectionRingCol * 0.2;
+                
+                rayDir = lightDir;
+                if (reflHit != 4294967295u)
+                {
+                    bool collided = false;
+                    float tD = 0;
+                    float stepSize = 15000;
+                    while (tD < 6000 && stepSize > 0.001 && !collided)
+                    {
+                        float3 deflection = float3(0, 0, 0);
+                        float minDist = 100000;
+                        for (uint i = 0; i < number; i++)
+                        {
+                            if (i != reflHit)
+                            {
+                                Sphere sph = sp[i];
+                                float3 delta = ray - sph.pos;
+                                float dst = max(length(delta) - sph.radius, 0);
+				
+                                if (sph.gravity != 0)
+                                {
+                                    minDist = min(minDist, dst);
+                        
+                                    float force = -pow(length(delta) / sph.gravity, -3);
+                                    if (force < -1)
+                                    {
+                                        collided = true;
+                                        reflectionCol *= 0.2;
+                                    }
+                                    deflection += normalize(delta) * force;
+                                }
+				
+                                if (sph.radius > 0 && !collided)
+                                {
+                                    minDist = min(minDist, dst + 0.003);
+
+                                    if (dst < 0.003)
+                                    {
+                                        reflectionCol *= 0.2;
+                                        collided = true;
+                                    }
+                                }
+                            }
+                        }
+                        minDist = min(minDist, 0.8 / length(deflection));
+                        stepSize = minDist;
+                        rayDir = normalize(rayDir + deflection * stepSize);
+                        tD += stepSize;
+                        ray += rayDir * stepSize;
+                    }
+                }
+            
+                col += reflectionCol;
+            }
+        }
+        col = Blueshift(col, bleushit) + atmoCol * 1.2 + ringCol;
+        Result[IDToSingle(id.xy)] = float4(col * exposure, 1);
+    }
+}
+
+half HM(half a)
+{
+    return (a + 3.1415926) % 6.2831853 - 3.1415926;
+}
+
+half rnd(half seed, int2 h)
+{
+    return frac(sin(seed * 26.24823 + (h.x + h.y * dimensions.x) * 0.127874) * 32782.4829);
+}
+
+RWTexture2D<float4> Res;
+float2 bloomSize;
+[numthreads(32, 32, 1)]
+void WriteToScreen(uint3 id : SV_DispatchThreadID)
+{
+    
+    if (id.x < dimensions.x * 2 && id.y < dimensions.y * 2)
+    {
+        float4 col = 0;
+        
+        half angle = bloomSize.y - 3.13;
+        for (half k = 1.3756; k < 200; k *= 1.74326)
+        {
+            while (angle < 3.141592)
+            {
+                col += Result[IDToSingle(id.xy + int2(cos(angle) * bloomSize.x * k, sin(angle) * bloomSize.x * k))] * exp(0.1 * -k * k);
+                angle += 0.94754 + rnd(angle, id.xy);
+            }
+            angle = HM(angle);
         }
         
+        col /= 9.5 / min(bloomSize.x * bloomSize.x, 1);
+        Res[id.xy] = Overbright(max(Result[IDToSingle(id.xy)], col));
     }
-    col = Blueshift(col, bleushit) + atmoCol * 1.2;
-    Result[id.xy] = float4(Overbright(col * exposure), 1);
 }
