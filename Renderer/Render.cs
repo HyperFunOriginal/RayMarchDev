@@ -13,6 +13,10 @@ namespace Raymarch
         {
             return GameObject.FindGameObjectWithTag("MainCamera").GetComponent<Render>();
         }
+        public static CommandParser GetCommandSystem()
+        {
+            return GameObject.FindGameObjectWithTag("Command").GetComponent<CommandParser>();
+        }
     }
     public static class Math
     {
@@ -88,7 +92,6 @@ namespace Raymarch
 
     public class Render : MonoBehaviour
     {
-
         [Header("Camera Data", order = 1)]
         public Vector3 cameraPosition;
         public Vector2 cameraEulerAngles;
@@ -103,6 +106,7 @@ namespace Raymarch
         public Texture2D skyBox;
 
         [Header("Settings", order = 4)]
+        public Vector2 fpsBounds;
         public float sunBrightness;
         public bool BlueshiftInvariant;
         public bool shadowsEnabled;
@@ -118,9 +122,13 @@ namespace Raymarch
 
         [Header("Internal Information", order = 0)]
         public ComputeShader Renderer;
+        public GameObject command;
         public RenderTexture screenTex;
+        internal FPSCounter counter;
+        private float renderScale;
         [SerializeField()]
         public List<SphereObject> spheresToRender;
+        [SerializeField()]
 
         public Vector3 rawCamMove;
         public Vector3 camMoveWorldSpace;
@@ -155,7 +163,7 @@ namespace Raymarch
                     if (typeof(MonoBehaviour).IsAssignableFrom(ty))
                     {
                         Debug.Log("Loaded class: " + ty.Name);
-                        GameObject go = new GameObject();
+                        GameObject go = new GameObject(ty.Name + ".mod");
                         go.AddComponent(ty);
                     }
                 }
@@ -164,13 +172,25 @@ namespace Raymarch
         // Use this for initialization
         void Start()
         {
+            fpsBounds = new Vector2(40f, 60f);
+            renderScale = 1f;
             Controller = Controls;
             oldCamPos = cameraPosition;
-            Application.targetFrameRate = 60;
-
+            counter = GameObject.Find("Text").GetComponent<FPSCounter>();
             LoadMods();
+            StartCoroutine(SlowUpdate());
         }
 
+        IEnumerator SlowUpdate()
+        {
+            while (true)
+            {
+                yield return new WaitForSecondsRealtime(1f);
+                fpsBounds.y = Mathf.Max(fpsBounds.y, 30f);
+                fpsBounds.x = Mathf.Min(fpsBounds.y - 7f, fpsBounds.x);
+                Application.targetFrameRate = (int)fpsBounds.y;
+            }
+        }
         struct Buffer
         {
             public float x, y, z;
@@ -179,15 +199,22 @@ namespace Raymarch
             public float vx, vy, vz;
             public float ax, ay;
             public float ar, ag, ab;
+            public float ir, or;
         }
-
         // Update is called once per frame
         void Update()
         {
+            if (counter.fps < fpsBounds.x)
+                renderScale = Mathf.Clamp(0.99f * renderScale, 0.2f, 1f);
+            if (counter.fps > fpsBounds.y - 5f)
+                renderScale = Mathf.Clamp01(renderScale + 0.0022f);
+
             if (builtinControls)
             {
                 MoveCam();
                 Controller.Invoke();
+                if (Input.GetKeyDown(KeyCode.C))
+                    command.SetActive(!command.activeSelf);
             }
             if (simEnabled)
             {
@@ -250,8 +277,8 @@ namespace Raymarch
         /// <param name="height">height of render, leave 0 or empty for game window height</param>
         void OnGPU(int width = 0, int height = 0)
         {
-            if (width == 0) width = Screen.width;
-            if (height == 0) height = Screen.height;
+            if (width == 0) width = (int)(Screen.width * renderScale);
+            if (height == 0) height = (int)(Screen.height * renderScale);
 
             if (screenTex == null || screenTex.width != width || screenTex.height != height)
             {
@@ -264,6 +291,8 @@ namespace Raymarch
                 };
                 screenTex.Create();
             }
+
+            ComputeBuffer image = new ComputeBuffer(screenTex.width * screenTex.height, sizeof(float) * 4);
 
             Buffer[] buff = new Buffer[Mathf.Max(spheresToRender.Count, 1)];
             for (int i = 0; i < spheresToRender.Count; i++)
@@ -286,21 +315,23 @@ namespace Raymarch
 
                     ar = spheresToRender[i].atmosphereCol.r,
                     ag = spheresToRender[i].atmosphereCol.g,
-                    ab = spheresToRender[i].atmosphereCol.b
+                    ab = spheresToRender[i].atmosphereCol.b,
+                    ir = spheresToRender[i].ringBounds.x,
+                    or = spheresToRender[i].ringBounds.y,
                 };
             }
             if (spheresToRender.Count < 1) buff[0] = new Buffer();
 
-            ComputeBuffer cb = new ComputeBuffer(buff.Length, sizeof(float) * 16);
+            ComputeBuffer cb = new ComputeBuffer(buff.Length, sizeof(float) * 18);
             cb.SetData(buff);
 
             Vector3 lightDir = Math.RotateVector(Vector3.back, lightDirection.x, lightDirection.y);
             Vector3 camDir = Math.RotateVector(Vector3.forward, cameraEulerAngles.x, cameraEulerAngles.y);
-            float skyboxBright = Mathf.Clamp01(1.2f - Vector3.Dot(camDir, lightDir) * sunBrightness);
             Renderer.SetBool("blueshiftEnabled", !BlueshiftInvariant);
             Renderer.SetBool("atmos", drawAtmospheres);
             Renderer.SetFloats("dimensions", screenTex.width * 0.5f, screenTex.height * 0.5f);
             Renderer.SetInts("skyboxDimensions", skyBox.width, skyBox.height);
+            Renderer.SetInt("number", spheresToRender.Count);
             Renderer.SetFloats("camAng", cameraEulerAngles.x, cameraEulerAngles.y);
             //Renderer.SetFloats("skyAng", skyboxAngle.x, skyboxAngle.y);
             Vector3 camVel = (cameraPosition - oldCamPos) * 0.225f / simSpeed;
@@ -309,25 +340,31 @@ namespace Raymarch
             Renderer.SetFloat("normalDim", Mathf.Sqrt(screenTex.width * screenTex.height) * 0.5f / Mathf.Tan(FOV * Mathf.Deg2Rad * 0.5f));
             Renderer.SetFloat("solarLuminosity", sunBrightness);
             Renderer.SetFloat("exposure", exposure);
-            Renderer.SetFloat("brightness", skyboxBright);
             Renderer.SetBool("shadows", shadowsEnabled);
             Renderer.SetBool("equirect", equirectangularProjection);
 
             if (!drawAtmospheres)
             {
                 Renderer.SetTexture(Renderer.FindKernel("Plain"), "skybox", skyBox);
-                Renderer.SetTexture(Renderer.FindKernel("Plain"), "Result", screenTex);
+                Renderer.SetBuffer(Renderer.FindKernel("Plain"), "Result", image);
                 Renderer.SetBuffer(Renderer.FindKernel("Plain"), "sp", cb);
                 Renderer.Dispatch(Renderer.FindKernel("Plain"), Mathf.CeilToInt(screenTex.width / 32f), Mathf.CeilToInt(screenTex.width / 32f), 1);
             }
             else
             {
                 Renderer.SetTexture(Renderer.FindKernel("Atmo"), "skybox", skyBox);
-                Renderer.SetTexture(Renderer.FindKernel("Atmo"), "Result", screenTex);
+                Renderer.SetBuffer(Renderer.FindKernel("Atmo"), "Result", image);
                 Renderer.SetBuffer(Renderer.FindKernel("Atmo"), "sp", cb);
                 Renderer.Dispatch(Renderer.FindKernel("Atmo"), Mathf.CeilToInt(screenTex.width / 32f), Mathf.CeilToInt(screenTex.width / 32f), 1);
             }
+
+            Renderer.SetBuffer(Renderer.FindKernel("WriteToScreen"), "Result", image);
+            Renderer.SetTexture(Renderer.FindKernel("WriteToScreen"), "Res", screenTex);
+            Renderer.SetFloats("bloomSize", equirectangularProjection ? width / 3000f : width / 1100f, UnityEngine.Random.Range(0f, 0.3f));
+            Renderer.Dispatch(Renderer.FindKernel("WriteToScreen"), Mathf.CeilToInt(screenTex.width / 32f), Mathf.CeilToInt(screenTex.width / 32f), 1);
+
             cb.Dispose();
+            image.Dispose();
         }
 
         /// <summary>
@@ -338,10 +375,16 @@ namespace Raymarch
             if (Input.GetKeyDown(KeyCode.X)) drawAtmospheres = !drawAtmospheres;
             if (Input.GetKeyDown(KeyCode.Z)) BlueshiftInvariant = !BlueshiftInvariant;
             if (Input.GetKeyDown(KeyCode.V)) shadowsEnabled = !shadowsEnabled;
-
+            if (Input.GetKey(KeyCode.Minus)) exposure *= 0.97f;
+            if (Input.GetKey(KeyCode.Equals)) exposure *= 1.03f;
             if (Input.GetKeyDown(KeyCode.Space)) simEnabled = !simEnabled;
             if (Input.GetKeyDown(KeyCode.Y)) equirectangularProjection = !equirectangularProjection;
-
+            if (Input.GetKey(KeyCode.LeftControl))
+            {
+                FOV = Mathf.Clamp(FOV * (1f + Input.mouseScrollDelta.y * 0.03f), 0f, 150f);
+                if (Input.GetMouseButton(2))
+                    FOV = 90f;
+            }
             if (Input.GetKeyDown(KeyCode.F12))
             {
                 if (equirectangularProjection)
@@ -358,7 +401,8 @@ namespace Raymarch
         private void MoveCam()
         {
             rawCamMove = Vector3.zero;
-            camMovementSpeed *= Input.mouseScrollDelta.y * 0.1f + 1f;
+            if (!Input.GetKey(KeyCode.LeftControl))
+                camMovementSpeed *= Input.mouseScrollDelta.y * 0.1f + 1f;
             camMovementSpeed = Mathf.Clamp(camMovementSpeed, 0.0005f / simSpeed, 24f);
 
             Vector2 dt = new Vector2(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"));
@@ -399,7 +443,8 @@ namespace Raymarch
             }
         }
     }
-    [System.Serializable]
+
+    [Serializable]
     public class SphereObject
     {
         public Vector3 pos = Vector3.zero;
@@ -411,9 +456,11 @@ namespace Raymarch
         public Vector3 momentum;
 
         private Vector3 accumulatedAcceleration;
-        private Vector3 accumulatedPosition;
+        private Vector3 accumulatedPosition;    
         public Vector2 atmosphericProperties = Vector2.one;
         public Color atmosphereCol = new Color(0.55f, 0.76f, 0.9f);
+
+        public Vector2 ringBounds;
         /// <summary>
         /// Accelerates sphere by acceleration
         /// </summary>
